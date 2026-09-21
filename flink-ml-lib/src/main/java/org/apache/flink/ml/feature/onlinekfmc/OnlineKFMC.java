@@ -36,6 +36,7 @@ import org.apache.flink.ml.linalg.DenseVector;
 import org.apache.flink.ml.param.Param;
 import org.apache.flink.ml.util.ParamUtils;
 import org.apache.flink.ml.util.ReadWriteUtils;
+import org.apache.flink.ml.util.RowUtils;
 import org.apache.flink.runtime.state.StateInitializationContext;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
@@ -51,6 +52,7 @@ import org.apache.flink.util.OutputTag;
 import org.apache.flink.util.Preconditions;
 
 import org.apache.commons.collections.IteratorUtils;
+import org.apache.commons.lang3.ArrayUtils;
 
 import java.io.IOException;
 import java.util.HashMap;
@@ -90,12 +92,15 @@ public class OnlineKFMC
                 (StreamTableEnvironment) ((TableImpl) inputs[0]).getTableEnvironment();
 
         RowTypeInfo inputTypeInfo = TableUtils.getRowTypeInfo(inputs[0].getResolvedSchema());
-        TypeInformation<?> featuresType = inputTypeInfo.getTypeAt(getFeaturesCol());
-        RowTypeInfo pointTypeInfo = new RowTypeInfo(new TypeInformation[] {featuresType});
+        int featuresIdx = inputTypeInfo.getFieldIndex(getFeaturesCol());
 
-        DataStream<Row> points =
-                tEnv.toDataStream(inputs[0])
-                        .map(row -> Row.of(row.getField(getFeaturesCol())), pointTypeInfo);
+        // Full input row (not just featuresCol) so non-features columns (e.g. ids/timestamps
+        // set by the caller) ride through the iteration body untouched and land back on the
+        // imputed output row -- avoids an external zip-by-arrival-order to reattach them.
+        // Identity map with an explicit RowTypeInfo: tEnv.toDataStream alone yields
+        // ExternalTypeInfo (Table API's internal type), not a RowTypeInfo, and the iteration
+        // body below needs a real RowTypeInfo to read field names/types off of.
+        DataStream<Row> points = tEnv.toDataStream(inputs[0]).map(row -> row, inputTypeInfo);
 
         Table initModelDataTable =
                 OnlineKFMCModelDataUtil.generateInitModelData(
@@ -114,6 +119,8 @@ public class OnlineKFMC
 
         IterationBody body =
                 new KFMCIterationBody(
+                        featuresIdx,
+                        getOutputCol(),
                         getGlobalBatchSize(),
                         getC(),
                         getQ(),
@@ -133,8 +140,12 @@ public class OnlineKFMC
         DataStream<Row> imputedData = result.get(1);
 
         Table onlineModelDataTable = tEnv.fromDataStream(onlineModelData);
+        String[] imputedColNames = ArrayUtils.add(inputTypeInfo.getFieldNames(), getOutputCol());
         Table imputedDataTable =
-                tEnv.fromDataStream(imputedData).as(getFeaturesCol(), getOutputCol());
+                tEnv.fromDataStream(imputedData)
+                        .as(
+                                imputedColNames[0],
+                                ArrayUtils.remove(imputedColNames, 0));
 
         OnlineKFMCModel model =
                 new OnlineKFMCModel().setModelData(onlineModelDataTable).setImputedData(imputedDataTable);
@@ -143,6 +154,8 @@ public class OnlineKFMC
     }
 
     private static class KFMCIterationBody implements IterationBody {
+        private final int featuresIdx;
+        private final String outputCol;
         private final int batchSize;
         private final double c;
         private final double q;
@@ -156,6 +169,8 @@ public class OnlineKFMC
         private final double sigma2;
 
         private KFMCIterationBody(
+                int featuresIdx,
+                String outputCol,
                 int batchSize,
                 double c,
                 double q,
@@ -167,6 +182,8 @@ public class OnlineKFMC
                 String missingInit,
                 String kernelType,
                 double sigma2) {
+            this.featuresIdx = featuresIdx;
+            this.outputCol = outputCol;
             this.batchSize = batchSize;
             this.c = c;
             this.q = q;
@@ -192,11 +209,11 @@ public class OnlineKFMC
                             + "of elements in each batch. Some subtasks might be idling forever.");
 
             RowTypeInfo pointTypeInfo = (RowTypeInfo) points.getType();
-            TypeInformation<?> featuresType = pointTypeInfo.getTypeAt(0);
+            TypeInformation<?> featuresType = pointTypeInfo.getTypeAt(featuresIdx);
             RowTypeInfo outputTypeInfo =
                     new RowTypeInfo(
-                            new TypeInformation[] {featuresType, featuresType},
-                            new String[] {"features", "imputed"});
+                            ArrayUtils.add(pointTypeInfo.getFieldTypes(), featuresType),
+                            ArrayUtils.add(pointTypeInfo.getFieldNames(), outputCol));
 
             SingleOutputStreamOperator<Row> localResult =
                     DataStreamUtils.generateBatchData(points, parallelism, batchSize)
@@ -205,7 +222,7 @@ public class OnlineKFMC
                                     "LocalImputeAndAccumulate",
                                     outputTypeInfo,
                                     new CalculateLocalImputeAndAccumulate(
-                                            c, q, nIter, eta, gamma, missingInit, kernelType, sigma2))
+                                            featuresIdx, c, q, nIter, eta, gamma, missingInit, kernelType, sigma2))
                             .setParallelism(parallelism);
 
             DataStream<Row> imputedRows = localResult;
@@ -276,6 +293,7 @@ public class OnlineKFMC
             implements TwoInputStreamOperator<Row[], OnlineKFMCModelData, Row> {
         private static final double CONVERGENCE_TOL = 1e-5;
 
+        private final int featuresIdx;
         private final int nIter;
         private final double eta;
         private final double gamma;
@@ -286,6 +304,7 @@ public class OnlineKFMC
         private transient ListState<Row[]> localBatchDataState;
 
         private CalculateLocalImputeAndAccumulate(
+                int featuresIdx,
                 double c,
                 double q,
                 int nIter,
@@ -294,6 +313,7 @@ public class OnlineKFMC
                 String missingInit,
                 String kernelType,
                 double sigma2) {
+            this.featuresIdx = featuresIdx;
             this.nIter = nIter;
             this.eta = eta;
             this.gamma = gamma;
@@ -360,7 +380,7 @@ public class OnlineKFMC
             DenseMatrix accumLastSeen = new DenseMatrix(dims, 1);
 
             for (Row point : points) {
-                DenseVector features = point.getFieldAs(0);
+                DenseVector features = point.getFieldAs(featuresIdx);
                 double[] x0 = features.values;
                 boolean[] observed = new boolean[dims];
                 double[] x = new double[dims];
@@ -424,7 +444,7 @@ public class OnlineKFMC
                     }
                 }
 
-                output.collect(new StreamRecord<>(Row.of(features, new DenseVector(x))));
+                output.collect(new StreamRecord<>(RowUtils.append(point, new DenseVector(x))));
             }
 
             if (points.length > 0) {

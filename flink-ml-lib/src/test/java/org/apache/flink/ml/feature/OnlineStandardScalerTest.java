@@ -366,6 +366,104 @@ public class OnlineStandardScalerTest extends AbstractTestBase {
                 standardScaler.getMaxAllowedModelDelayMs());
     }
 
+    /**
+     * Generates a batch of rows with a fixed fraction of NaN (missing) cells, fits {@link
+     * OnlineStandardScaler} over it under {@link GlobalWindows}, and checks the emitted mean/std
+     * against a manual per-feature reference that skips NaN — plus reports rows/sec throughput.
+     */
+    @Test
+    public void testNanSkippingMeanStdAndThroughput() throws Exception {
+        int numRows = 20_000;
+        int dims = 5;
+        double nanRate = 0.1;
+        java.util.Random random = new java.util.Random(42);
+
+        List<Row> rows = new ArrayList<>(numRows);
+        // The full dataset as generated, before any cell is blanked out to NaN — this is the
+        // "original dataset" ground truth to compare the NaN-skipping job result against.
+        double[][] originalValues = new double[numRows][dims];
+        double[][] values = new double[numRows][dims];
+        for (int i = 0; i < numRows; i++) {
+            for (int j = 0; j < dims; j++) {
+                double v = random.nextBoolean() ? random.nextGaussian() * 3 : random.nextDouble() * 3;
+                originalValues[i][j] = v;
+                values[i][j] = random.nextDouble() < nanRate ? Double.NaN : v;
+            }
+            rows.add(Row.of(Vectors.dense(values[i])));
+        }
+
+        double[] originalMean = new double[dims];
+        double[] originalStd = new double[dims];
+        meanStd(originalValues, numRows, dims, originalMean, originalStd);
+
+        // Manual reference: per-feature mean/std over non-NaN values only (same skip logic the
+        // job uses), so this should match the job's output exactly.
+        double[] expectedMean = new double[dims];
+        double[] expectedStd = new double[dims];
+        meanStd(values, numRows, dims, expectedMean, expectedStd);
+
+        Table input = tEnv.fromDataStream(env.fromCollection(rows)).as("input");
+        OnlineStandardScaler standardScaler =
+                new OnlineStandardScaler().setWindows(GlobalWindows.getInstance());
+
+        long start = System.nanoTime();
+        OnlineStandardScalerModel model = standardScaler.fit(input);
+        List<StandardScalerModelData> collectedModelData =
+                IteratorUtils.toList(
+                        StandardScalerModelData.getModelDataStream(model.getModelData()[0])
+                                .executeAndCollect());
+        double elapsedSec = (System.nanoTime() - start) / 1e9;
+
+        assertEquals(1, collectedModelData.size());
+        double[] actualMean = collectedModelData.get(0).mean.values;
+        double[] actualStd = collectedModelData.get(0).std.values;
+
+        System.out.printf(
+                "OnlineStandardScaler NaN-skip: %d rows x %d dims, %.0f%% NaN -> %.2fs (%.0f rows/sec)%n",
+                numRows, dims, nanRate * 100, elapsedSec, numRows / elapsedSec);
+        for (int j = 0; j < dims; j++) {
+            System.out.printf(
+                    "  feature %d: mean job=%.6f ref=%.6f original=%.6f | std job=%.6f ref=%.6f"
+                            + " original=%.6f%n",
+                    j,
+                    actualMean[j],
+                    expectedMean[j],
+                    originalMean[j],
+                    actualStd[j],
+                    expectedStd[j],
+                    originalStd[j]);
+        }
+
+        // job/ref must match exactly (same skip logic). job/original only converge as numRows
+        // grows and nanRate shrinks - it's a sanity check, not an exact-match assertion.
+        assertArrayEquals(expectedMean, actualMean, TOLERANCE);
+        assertArrayEquals(expectedStd, actualStd, TOLERANCE);
+    }
+
+    /** Per-feature mean/std over non-NaN values only; writes into {@code mean}/{@code std}. */
+    private static void meanStd(
+            double[][] values, int numRows, int dims, double[] mean, double[] std) {
+        for (int j = 0; j < dims; j++) {
+            double sum = 0;
+            int count = 0;
+            for (int i = 0; i < numRows; i++) {
+                if (!Double.isNaN(values[i][j])) {
+                    sum += values[i][j];
+                    count++;
+                }
+            }
+            double m = sum / count;
+            double sqDiff = 0;
+            for (int i = 0; i < numRows; i++) {
+                if (!Double.isNaN(values[i][j])) {
+                    sqDiff += (values[i][j] - m) * (values[i][j] - m);
+                }
+            }
+            mean[j] = m;
+            std[j] = Math.sqrt(sqDiff / (count - 1));
+        }
+    }
+
     @Test
     public void testSaveLoadPredict() throws Exception {
         OnlineStandardScaler standardScaler =
